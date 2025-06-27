@@ -3,7 +3,7 @@
 /**
  * Google Meet MCP Server
  * This implements the Model Context Protocol server for Google Meet
- * functionality via the Google Calendar API.
+ * functionality via the Google Calendar API with automatic authentication.
  */
 
 import path from 'path';
@@ -19,6 +19,7 @@ import {
 } from '@modelcontextprotocol/sdk/types.js';
 
 import GoogleMeetAPI from './GoogleMeetAPI.js';
+import { AuthServer } from './AuthServer.js';
 
 // Get __dirname equivalent in ES modules
 const __filename = fileURLToPath(import.meta.url);
@@ -41,17 +42,28 @@ class GoogleMeetMcpServer {
       }
     );
 
-    // Setup Google Meet API client
-    const credentialsPath = process.env.GOOGLE_MEET_CREDENTIALS_PATH;
-    const tokenPath = process.env.GOOGLE_MEET_TOKEN_PATH;
+    // Setup Google Meet API client with environment variable support
+    // 優先使用 GOOGLE_OAUTH_CREDENTIALS (與 google-calendar-mcp 一致)
+    this.credentialsPath = process.env.GOOGLE_OAUTH_CREDENTIALS || 
+                          process.env.GOOGLE_MEET_CREDENTIALS_PATH;
     
-    if (!credentialsPath || !tokenPath) {
-      console.error("Error: Missing required environment variables.");
-      console.error("Please set GOOGLE_MEET_CREDENTIALS_PATH and GOOGLE_MEET_TOKEN_PATH");
+    if (!this.credentialsPath) {
+      console.error("❌ 錯誤：缺少必要的環境變數");
+      console.error("請設定 GOOGLE_OAUTH_CREDENTIALS 或 GOOGLE_MEET_CREDENTIALS_PATH");
+      console.error("範例：GOOGLE_OAUTH_CREDENTIALS=/path/to/your/credentials.json");
+      console.error("參考 google-calendar-mcp 的設定方式：https://github.com/nspady/google-calendar-mcp");
       process.exit(1);
     }
 
-    this.googleMeet = new GoogleMeetAPI(credentialsPath, tokenPath);
+    // Token path can be customized via environment variable
+    // 支援 google-calendar-mcp 的 token 路徑環境變數
+    this.tokenPath = process.env.GOOGLE_CALENDAR_MCP_TOKEN_PATH || 
+                    process.env.GOOGLE_MEET_TOKEN_PATH ||
+                    this.getDefaultTokenPath();
+
+    this.googleMeet = null;
+    this.authServer = null;
+    this.isAuthenticated = false;
     
     // Setup request handlers
     this.setupToolHandlers();
@@ -60,9 +72,93 @@ class GoogleMeetMcpServer {
     this.server.onerror = error => console.error(`[MCP Error] ${error}`);
     
     process.on('SIGINT', async () => {
-      await this.server.close();
+      await this.cleanup();
       process.exit(0);
     });
+  }
+
+  /**
+   * Get default token path based on OS
+   */
+  getDefaultTokenPath() {
+    const os = process.platform;
+    const homeDir = process.env.HOME || process.env.USERPROFILE;
+    
+    if (os === 'win32') {
+      return path.join(homeDir, 'AppData', 'Local', 'google-meet-mcp', 'token.json');
+    } else if (os === 'darwin') {
+      return path.join(homeDir, 'Library', 'Application Support', 'google-meet-mcp', 'token.json');
+    } else {
+      return path.join(homeDir, '.config', 'google-meet-mcp', 'token.json');
+    }
+  }
+
+  /**
+   * Initialize authentication automatically
+   */
+  async initializeAuthentication() {
+    try {
+      // Try to initialize with existing tokens first
+      this.googleMeet = new GoogleMeetAPI(this.credentialsPath, this.tokenPath);
+      
+      try {
+        await this.googleMeet.initialize();
+        this.isAuthenticated = true;
+        console.error('✅ 找到有效的認證 token，無需重新認證');
+        return true;
+      } catch (error) {
+        // No valid tokens, need to authenticate
+        console.error('ℹ️ 未找到有效的認證 token，啟動自動認證流程...');
+      }
+
+      // Start automatic authentication
+      this.authServer = new AuthServer(this.credentialsPath, this.tokenPath);
+      const authSuccess = await this.authServer.start(true); // openBrowser = true
+      
+      if (authSuccess) {
+        // Re-initialize with new tokens
+        await this.googleMeet.initialize();
+        this.isAuthenticated = true;
+        console.error('✅ 自動認證成功！');
+        return true;
+      } else {
+        console.error('❌ 自動認證失敗');
+        return false;
+      }
+    } catch (error) {
+      console.error('❌ 認證初始化失敗：', error.message);
+      return false;
+    }
+  }
+
+  /**
+   * Ensure authentication before tool execution
+   */
+  async ensureAuthenticated() {
+    if (this.isAuthenticated) {
+      return;
+    }
+
+    // Try to re-authenticate
+    const success = await this.initializeAuthentication();
+    if (!success) {
+      throw new McpError(
+        ErrorCode.InvalidRequest,
+        '認證失敗。請檢查您的憑證設定並重新啟動服務。'
+      );
+    }
+  }
+
+  /**
+   * Cleanup resources
+   */
+  async cleanup() {
+    if (this.authServer) {
+      await this.authServer.stop();
+    }
+    if (this.server) {
+      await this.server.close();
+    }
   }
 
   /**
@@ -81,21 +177,21 @@ class GoogleMeetMcpServer {
       tools: [
         {
           name: 'list_meetings',
-          description: 'List upcoming Google Meet meetings',
+          description: '📅 列出即將到來的 Google Meet 會議',
           inputSchema: {
             type: 'object',
             properties: {
               max_results: {
                 type: 'number',
-                description: 'Maximum number of results to return (default: 10)'
+                description: '最多返回的結果數量 (預設: 10)'
               },
               time_min: {
                 type: 'string',
-                description: 'Start time in ISO format (default: now)'
+                description: '開始時間 (ISO 格式，預設: 現在)'
               },
               time_max: {
                 type: 'string',
-                description: 'End time in ISO format (optional)'
+                description: '結束時間 (ISO 格式，可選)'
               }
             },
             required: []
@@ -103,13 +199,13 @@ class GoogleMeetMcpServer {
         },
         {
           name: 'get_meeting',
-          description: 'Get details of a specific Google Meet meeting',
+          description: '🔍 獲取特定 Google Meet 會議的詳細資訊',
           inputSchema: {
             type: 'object',
             properties: {
               meeting_id: {
                 type: 'string',
-                description: 'ID of the meeting to retrieve'
+                description: '要查詢的會議 ID'
               }
             },
             required: ['meeting_id']
@@ -117,32 +213,36 @@ class GoogleMeetMcpServer {
         },
         {
           name: 'create_meeting',
-          description: 'Create a new Google Meet meeting',
+          description: '✨ 創建新的 Google Meet 會議（包含時間衝突檢測）',
           inputSchema: {
             type: 'object',
             properties: {
               summary: {
                 type: 'string',
-                description: 'Title of the meeting'
+                description: '會議標題'
               },
               description: {
                 type: 'string', 
-                description: 'Description for the meeting (optional)'
+                description: '會議描述 (可選)'
               },
               start_time: {
                 type: 'string',
-                description: 'Start time in ISO format'
+                description: '開始時間 (ISO 格式)'
               },
               end_time: {
                 type: 'string',
-                description: 'End time in ISO format'
+                description: '結束時間 (ISO 格式)'
               },
               attendees: {
                 type: 'array',
-                description: 'List of email addresses for attendees (optional)',
+                description: '參與者電子郵件地址列表 (可選)',
                 items: {
                   type: 'string'
                 }
+              },
+              check_conflicts: {
+                type: 'boolean',
+                description: '是否檢查時間衝突 (預設: true)'
               }
             },
             required: ['summary', 'start_time', 'end_time']
@@ -150,33 +250,33 @@ class GoogleMeetMcpServer {
         },
         {
           name: 'update_meeting',
-          description: 'Update an existing Google Meet meeting',
+          description: '📝 更新現有的 Google Meet 會議',
           inputSchema: {
             type: 'object',
             properties: {
               meeting_id: {
                 type: 'string',
-                description: 'ID of the meeting to update'
+                description: '要更新的會議 ID'
               },
               summary: {
                 type: 'string', 
-                description: 'Updated title of the meeting (optional)'
+                description: '更新的會議標題 (可選)'
               },
               description: {
                 type: 'string', 
-                description: 'Updated description for the meeting (optional)'
+                description: '更新的會議描述 (可選)'
               },
               start_time: {
                 type: 'string', 
-                description: 'Updated start time in ISO format (optional)'
+                description: '更新的開始時間 (ISO 格式，可選)'
               },
               end_time: {
                 type: 'string', 
-                description: 'Updated end time in ISO format (optional)'
+                description: '更新的結束時間 (ISO 格式，可選)'
               },
               attendees: {
                 type: 'array', 
-                description: 'Updated list of email addresses for attendees (optional)',
+                description: '更新的參與者電子郵件地址列表 (可選)',
                 items: {
                   type: 'string'
                 }
@@ -187,16 +287,41 @@ class GoogleMeetMcpServer {
         },
         {
           name: 'delete_meeting',
-          description: 'Delete a Google Meet meeting',
+          description: '🗑️ 刪除 Google Meet 會議',
           inputSchema: {
             type: 'object',
             properties: {
               meeting_id: {
                 type: 'string',
-                description: 'ID of the meeting to delete'
+                description: '要刪除的會議 ID'
               }
             },
             required: ['meeting_id']
+          }
+        },
+        {
+          name: 'check_availability',
+          description: '⏰ 檢查特定時間範圍的可用性',
+          inputSchema: {
+            type: 'object',
+            properties: {
+              start_time: {
+                type: 'string',
+                description: '開始時間 (ISO 格式)'
+              },
+              end_time: {
+                type: 'string',
+                description: '結束時間 (ISO 格式)'
+              },
+              calendars: {
+                type: 'array',
+                description: '要檢查的日曆列表 (預設: ["primary"])',
+                items: {
+                  type: 'string'
+                }
+              }
+            },
+            required: ['start_time', 'end_time']
           }
         }
       ]
@@ -204,189 +329,310 @@ class GoogleMeetMcpServer {
   }
 
   /**
-   * Handle tool calls
+   * Handle tool execution requests
    */
   async handleCallTool(request) {
-    // Initialize the API if not already initialized
-    if (!this.googleMeet.calendar) {
-      try {
-        await this.googleMeet.initialize();
-      } catch (error) {
-        return {
-          content: [
-            {
-              type: 'text',
-              text: `Error initializing Google Meet API: ${error.message}`
-            }
-          ],
-          isError: true
-        };
-      }
-    }
-
-    const toolName = request.params.name;
-    const args = request.params.arguments || {};
+    const { name, arguments: args } = request.params;
 
     try {
-      if (toolName === 'list_meetings') {
-        const maxResults = args.max_results || 10;
-        const timeMin = args.time_min || null;
-        const timeMax = args.time_max || null;
+      // Ensure authentication before any tool execution
+      await this.ensureAuthenticated();
 
-        const meetings = await this.googleMeet.listMeetings(
-          maxResults,
-          timeMin,
-          timeMax
-        );
-
-        return {
-          content: [
-            {
-              type: 'text',
-              text: JSON.stringify(meetings, null, 2)
-            }
-          ]
-        };
-      } 
-      else if (toolName === 'get_meeting') {
-        const meetingId = args.meeting_id;
-        if (!meetingId) {
-          throw new McpError(ErrorCode.InvalidParams, 'meeting_id is required');
-        }
-
-        const meeting = await this.googleMeet.getMeeting(meetingId);
-
-        return {
-          content: [
-            {
-              type: 'text',
-              text: JSON.stringify(meeting, null, 2)
-            }
-          ]
-        };
-      } 
-      else if (toolName === 'create_meeting') {
-        const { summary, description = '', start_time, end_time, attendees = [] } = args;
-
-        // Validate required parameters
-        if (!summary || !start_time || !end_time) {
-          const missing = [];
-          if (!summary) missing.push('summary');
-          if (!start_time) missing.push('start_time');
-          if (!end_time) missing.push('end_time');
-
-          throw new McpError(
-            ErrorCode.InvalidParams,
-            `Missing required parameters: ${missing.join(', ')}`
-          );
-        }
-
-        const meeting = await this.googleMeet.createMeeting(
-          summary,
-          start_time,
-          end_time,
-          description,
-          attendees
-        );
-
-        return {
-          content: [
-            {
-              type: 'text',
-              text: JSON.stringify(meeting, null, 2)
-            }
-          ]
-        };
-      } 
-      else if (toolName === 'update_meeting') {
-        const { meeting_id, summary, description, start_time, end_time, attendees } = args;
-
-        if (!meeting_id) {
-          throw new McpError(ErrorCode.InvalidParams, 'meeting_id is required');
-        }
-
-        // Extract optional parameters
-        const updateData = {};
-        if (summary !== undefined) updateData.summary = summary;
-        if (description !== undefined) updateData.description = description;
-        if (start_time !== undefined) updateData.startTime = start_time;
-        if (end_time !== undefined) updateData.endTime = end_time;
-        if (attendees !== undefined) updateData.attendees = attendees;
-
-        if (Object.keys(updateData).length === 0) {
-          throw new McpError(
-            ErrorCode.InvalidParams,
-            'At least one field to update must be provided'
-          );
-        }
-
-        const meeting = await this.googleMeet.updateMeeting(meeting_id, updateData);
-
-        return {
-          content: [
-            {
-              type: 'text',
-              text: JSON.stringify(meeting, null, 2)
-            }
-          ]
-        };
-      } 
-      else if (toolName === 'delete_meeting') {
-        const { meeting_id } = args;
+      switch (name) {
+        case 'list_meetings':
+          return await this.handleListMeetings(args);
         
-        if (!meeting_id) {
-          throw new McpError(ErrorCode.InvalidParams, 'meeting_id is required');
-        }
+        case 'get_meeting':
+          return await this.handleGetMeeting(args);
+        
+        case 'create_meeting':
+          return await this.handleCreateMeeting(args);
+        
+        case 'update_meeting':
+          return await this.handleUpdateMeeting(args);
+        
+        case 'delete_meeting':
+          return await this.handleDeleteMeeting(args);
 
-        await this.googleMeet.deleteMeeting(meeting_id);
+        case 'check_availability':
+          return await this.handleCheckAvailability(args);
 
-        return {
-          content: [
-            {
-              type: 'text',
-              text: 'Meeting successfully deleted'
-            }
-          ]
-        };
-      } 
-      else {
-        throw new McpError(
-          ErrorCode.MethodNotFound,
-          `Unknown tool: ${toolName}`
-        );
+        default:
+          throw new McpError(
+            ErrorCode.MethodNotFound,
+            `未知的工具: ${name}`
+          );
       }
     } catch (error) {
-      // Handle any errors from Google API or MCP errors
       if (error instanceof McpError) {
         throw error;
       }
-
-      return {
-        content: [
-          {
-            type: 'text',
-            text: `Error: ${error.message}`
-          }
-        ],
-        isError: true
-      };
+      
+      // Provide helpful error messages in Traditional Chinese
+      let errorMessage = error.message;
+      if (error.message.includes('credentials')) {
+        errorMessage += '\n\n💡 解決建議：\n' +
+                       '1. 確認 GOOGLE_OAUTH_CREDENTIALS 環境變數設定正確\n' +
+                       '2. 檢查憑證檔案路徑是否存在\n' +
+                       '3. 重新啟動服務以觸發自動認證';
+      } else if (error.message.includes('token')) {
+        errorMessage += '\n\n💡 解決建議：\n' +
+                       '1. 重新啟動服務以觸發自動認證\n' +
+                       '2. 檢查網路連接\n' +
+                       '3. 確認 Google Cloud 專案設定正確';
+      }
+      
+      throw new McpError(
+        ErrorCode.InternalError,
+        `執行工具時發生錯誤: ${errorMessage}`
+      );
     }
   }
 
   /**
-   * Run the server
+   * Handle list meetings request
+   */
+  async handleListMeetings(args) {
+    const { max_results = 10, time_min, time_max } = args;
+    
+    try {
+      const meetings = await this.googleMeet.listMeetings(max_results, time_min, time_max);
+      
+      return {
+        content: [
+          {
+            type: 'text',
+            text: `📅 **找到 ${meetings.length} 個即將到來的 Google Meet 會議**\n\n` +
+                  meetings.map((meeting, index) => 
+                    `**${index + 1}. ${meeting.summary}**\n` +
+                    `🕐 時間：${new Date(meeting.start_time).toLocaleString('zh-TW')} - ${new Date(meeting.end_time).toLocaleString('zh-TW')}\n` +
+                    `🔗 會議連結：${meeting.meet_link}\n` +
+                    `👥 參與者：${meeting.attendees.length} 人\n` +
+                    `📋 ID：${meeting.id}\n`
+                  ).join('\n') || '目前沒有即將到來的會議。'
+          }
+        ]
+      };
+    } catch (error) {
+      throw new McpError(ErrorCode.InternalError, `列出會議時發生錯誤: ${error.message}`);
+    }
+  }
+
+  /**
+   * Handle get meeting request
+   */
+  async handleGetMeeting(args) {
+    const { meeting_id } = args;
+    
+    if (!meeting_id) {
+      throw new McpError(ErrorCode.InvalidParams, '缺少必要參數: meeting_id');
+    }
+    
+    try {
+      const meeting = await this.googleMeet.getMeeting(meeting_id);
+      
+      return {
+        content: [
+          {
+            type: 'text',
+            text: `📋 **會議詳細資訊**\n\n` +
+                  `**標題：** ${meeting.summary}\n` +
+                  `**描述：** ${meeting.description || '無'}\n` +
+                  `**開始時間：** ${new Date(meeting.start_time).toLocaleString('zh-TW')}\n` +
+                  `**結束時間：** ${new Date(meeting.end_time).toLocaleString('zh-TW')}\n` +
+                  `**Google Meet 連結：** ${meeting.meet_link}\n` +
+                  `**會議 ID：** ${meeting.id}\n` +
+                  `**參與者：**\n${meeting.attendees.map(a => `  • ${a.email} (${a.status})`).join('\n') || '  無參與者'}\n` +
+                  `**創建時間：** ${new Date(meeting.created).toLocaleString('zh-TW')}\n` +
+                  `**最後更新：** ${new Date(meeting.updated).toLocaleString('zh-TW')}`
+          }
+        ]
+      };
+    } catch (error) {
+      throw new McpError(ErrorCode.InternalError, `獲取會議資訊時發生錯誤: ${error.message}`);
+    }
+  }
+
+  /**
+   * Handle create meeting request with conflict detection
+   */
+  async handleCreateMeeting(args) {
+    const { 
+      summary, 
+      description = '', 
+      start_time, 
+      end_time, 
+      attendees = [],
+      check_conflicts = true 
+    } = args;
+    
+    if (!summary || !start_time || !end_time) {
+      throw new McpError(ErrorCode.InvalidParams, '缺少必要參數: summary, start_time, end_time');
+    }
+    
+    try {
+      let conflictWarning = '';
+      
+      // Check for time conflicts if requested
+      if (check_conflicts) {
+        const conflicts = await this.googleMeet.checkTimeConflicts(start_time, end_time);
+        if (conflicts.length > 0) {
+          conflictWarning = `\n⚠️ **時間衝突警告：**\n` +
+                           conflicts.map(conflict => 
+                             `• ${conflict.summary} (${new Date(conflict.start_time).toLocaleString('zh-TW')} - ${new Date(conflict.end_time).toLocaleString('zh-TW')})`
+                           ).join('\n') + '\n';
+        }
+      }
+      
+      const meeting = await this.googleMeet.createMeeting(summary, start_time, end_time, description, attendees);
+      
+      return {
+        content: [
+          {
+            type: 'text',
+            text: `✅ **會議創建成功！**\n\n` +
+                  conflictWarning +
+                  `**會議資訊：**\n` +
+                  `📋 標題：${meeting.summary}\n` +
+                  `📝 描述：${meeting.description || '無'}\n` +
+                  `🕐 開始時間：${new Date(meeting.start_time).toLocaleString('zh-TW')}\n` +
+                  `🕐 結束時間：${new Date(meeting.end_time).toLocaleString('zh-TW')}\n` +
+                  `🔗 **Google Meet 連結：** ${meeting.meet_link}\n` +
+                  `📞 電話撥入：${meeting.phone_info || '無'}\n` +
+                  `👥 參與者：${meeting.attendees.length} 人\n` +
+                  `📧 邀請已發送給：${attendees.join(', ') || '無'}\n` +
+                  `🆔 會議 ID：${meeting.id}\n\n` +
+                  `💡 **提示：** 您可以複製上方的 Google Meet 連結分享給參與者，或者他們會收到日曆邀請。`
+          }
+        ]
+      };
+    } catch (error) {
+      throw new McpError(ErrorCode.InternalError, `創建會議時發生錯誤: ${error.message}`);
+    }
+  }
+
+  /**
+   * Handle update meeting request
+   */
+  async handleUpdateMeeting(args) {
+    const { meeting_id, ...updateFields } = args;
+    
+    if (!meeting_id) {
+      throw new McpError(ErrorCode.InvalidParams, '缺少必要參數: meeting_id');
+    }
+    
+    try {
+      const meeting = await this.googleMeet.updateMeeting(meeting_id, updateFields);
+      
+      return {
+        content: [
+          {
+            type: 'text',
+            text: `✅ **會議更新成功！**\n\n` +
+                  `**更新後的會議資訊：**\n` +
+                  `📋 標題：${meeting.summary}\n` +
+                  `📝 描述：${meeting.description || '無'}\n` +
+                  `🕐 開始時間：${new Date(meeting.start_time).toLocaleString('zh-TW')}\n` +
+                  `🕐 結束時間：${new Date(meeting.end_time).toLocaleString('zh-TW')}\n` +
+                  `🔗 Google Meet 連結：${meeting.meet_link}\n` +
+                  `👥 參與者：${meeting.attendees.length} 人\n` +
+                  `🆔 會議 ID：${meeting.id}\n\n` +
+                  `📧 **更新通知已發送給所有參與者。**`
+          }
+        ]
+      };
+    } catch (error) {
+      throw new McpError(ErrorCode.InternalError, `更新會議時發生錯誤: ${error.message}`);
+    }
+  }
+
+  /**
+   * Handle delete meeting request
+   */
+  async handleDeleteMeeting(args) {
+    const { meeting_id } = args;
+    
+    if (!meeting_id) {
+      throw new McpError(ErrorCode.InvalidParams, '缺少必要參數: meeting_id');
+    }
+    
+    try {
+      await this.googleMeet.deleteMeeting(meeting_id);
+      
+      return {
+        content: [
+          {
+            type: 'text',
+            text: `✅ **會議刪除成功！**\n\n` +
+                  `會議 ID：${meeting_id}\n\n` +
+                  `📧 **取消通知已發送給所有參與者。**`
+          }
+        ]
+      };
+    } catch (error) {
+      throw new McpError(ErrorCode.InternalError, `刪除會議時發生錯誤: ${error.message}`);
+    }
+  }
+
+  /**
+   * Handle check availability request
+   */
+  async handleCheckAvailability(args) {
+    const { start_time, end_time, calendars = ['primary'] } = args;
+    
+    if (!start_time || !end_time) {
+      throw new McpError(ErrorCode.InvalidParams, '缺少必要參數: start_time, end_time');
+    }
+    
+    try {
+      const availability = await this.googleMeet.checkAvailability(start_time, end_time, calendars);
+      
+      return {
+        content: [
+          {
+            type: 'text',
+            text: `⏰ **時間可用性檢查結果**\n\n` +
+                  `**檢查時間範圍：**\n` +
+                  `🕐 ${new Date(start_time).toLocaleString('zh-TW')} - ${new Date(end_time).toLocaleString('zh-TW')}\n\n` +
+                  `**結果：** ${availability.available ? '✅ 時間可用' : '❌ 時間有衝突'}\n\n` +
+                  (availability.conflicts.length > 0 ? 
+                    `**衝突的會議：**\n` +
+                    availability.conflicts.map(conflict => 
+                      `• ${conflict.summary} (${new Date(conflict.start_time).toLocaleString('zh-TW')} - ${new Date(conflict.end_time).toLocaleString('zh-TW')})`
+                    ).join('\n')
+                    : '🎉 在此時間範圍內沒有其他會議！'
+                  )
+          }
+        ]
+      };
+    } catch (error) {
+      throw new McpError(ErrorCode.InternalError, `檢查可用性時發生錯誤: ${error.message}`);
+    }
+  }
+
+  /**
+   * Start the server with automatic authentication
    */
   async run() {
+    console.error('🚀 Google Meet MCP Server 正在啟動...');
+    
+    // Initialize authentication automatically
+    const authSuccess = await this.initializeAuthentication();
+    if (!authSuccess) {
+      console.error('❌ 無法完成認證，服務器啟動失敗');
+      process.exit(1);
+    }
+    
+    // Start the MCP server
     const transport = new StdioServerTransport();
-    console.error('Google Meet MCP server starting on stdio...');
     await this.server.connect(transport);
-    console.error('Google Meet MCP server connected');
+    console.error('✅ Google Meet MCP Server 已成功啟動並完成認證！');
   }
 }
 
-// Create and run the server
+// Start the server
 const server = new GoogleMeetMcpServer();
-server.run().catch(err => {
-  console.error('Fatal error:', err);
+server.run().catch(error => {
+  console.error('❌ 服務器啟動失敗：', error.message);
   process.exit(1);
 });

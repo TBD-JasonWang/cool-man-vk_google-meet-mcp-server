@@ -10,7 +10,7 @@ import { google } from 'googleapis';
 class GoogleMeetAPI {
   /**
    * Initialize the Google Meet API client.
-   * @param {string} credentialsPath - Path to the client_secret.json file
+   * @param {string} credentialsPath - Path to the OAuth credentials file
    * @param {string} tokenPath - Path to save/load the token.json file
    */
   constructor(credentialsPath, tokenPath) {
@@ -23,9 +23,33 @@ class GoogleMeetAPI {
    * Initialize the API client with OAuth2 credentials.
    */
   async initialize() {
+    try {
+      // Check if credentials file exists
+      await fs.access(this.credentialsPath);
+    } catch (error) {
+      throw new Error(
+        `找不到憑證檔案：${this.credentialsPath}\n` +
+        `請設定 GOOGLE_OAUTH_CREDENTIALS 環境變數為正確的檔案路徑。\n` +
+        `參考：https://github.com/nspady/google-calendar-mcp`
+      );
+    }
+
     const credentials = JSON.parse(await fs.readFile(this.credentialsPath, 'utf8'));
     
-    const { client_id, client_secret, redirect_uris } = credentials.web;
+    // Support both web and installed app credential formats (like google-calendar-mcp)
+    let clientConfig;
+    if (credentials.web) {
+      clientConfig = credentials.web;
+    } else if (credentials.installed) {
+      clientConfig = credentials.installed;
+    } else {
+      throw new Error(
+        '無效的憑證檔案格式。預期包含 "web" 或 "installed" OAuth 客戶端配置。\n' +
+        '請確認您下載的是 Desktop App 類型的 OAuth 憑證。'
+      );
+    }
+    
+    const { client_id, client_secret, redirect_uris } = clientConfig;
     
     const oAuth2Client = new google.auth.OAuth2(
       client_id, 
@@ -41,13 +65,15 @@ class GoogleMeetAPI {
       // Check if token is expired and needs refresh
       if (token.expiry_date && token.expiry_date < Date.now()) {
         // Token is expired, refresh it
-        const { credentials } = await oAuth2Client.refreshToken(token.refresh_token);
-        await fs.writeFile(this.tokenPath, JSON.stringify(credentials));
-        oAuth2Client.setCredentials(credentials);
+        const { credentials: newCredentials } = await oAuth2Client.refreshToken(token.refresh_token);
+        await fs.writeFile(this.tokenPath, JSON.stringify(newCredentials));
+        oAuth2Client.setCredentials(newCredentials);
       }
     } catch (error) {
       throw new Error(
-        "No valid credentials. Please run the setup script first to authorize access."
+        `在 ${this.tokenPath} 找不到有效的 token。\n` +
+        `請先執行認證設定：npm run auth\n` +
+        `錯誤詳情：${error.message}`
       );
     }
     
@@ -99,7 +125,7 @@ class GoogleMeetAPI {
       
       return meetings;
     } catch (error) {
-      throw new Error(`Error listing meetings: ${error.message}`);
+      throw new Error(`列出會議時發生錯誤：${error.message}`);
     }
   }
   
@@ -119,17 +145,17 @@ class GoogleMeetAPI {
       const event = response.data;
       
       if (!event.conferenceData) {
-        throw new Error(`Event with ID ${meetingId} does not have Google Meet conferencing data`);
+        throw new Error(`ID 為 ${meetingId} 的事件沒有 Google Meet 會議資料`);
       }
       
       const meeting = this._formatMeetingData(event);
       if (!meeting) {
-        throw new Error(`Failed to format meeting data for event ID ${meetingId}`);
+        throw new Error(`無法格式化事件 ID ${meetingId} 的會議資料`);
       }
       
       return meeting;
     } catch (error) {
-      throw new Error(`Error getting meeting: ${error.message}`);
+      throw new Error(`獲取會議資訊時發生錯誤：${error.message}`);
     }
   }
   
@@ -161,7 +187,7 @@ class GoogleMeetAPI {
       attendees: formattedAttendees,
       conferenceData: {
         createRequest: {
-          requestId: `meet-${Date.now()}`
+          requestId: `meet-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`
         }
       }
     };
@@ -170,151 +196,274 @@ class GoogleMeetAPI {
       const response = await this.calendar.events.insert({
         calendarId: 'primary',
         conferenceDataVersion: 1,
+        sendUpdates: 'all', // Send invitations to all attendees
         resource: event
       });
       
       const createdEvent = response.data;
-      
-      if (!createdEvent.conferenceData) {
-        throw new Error("Failed to create Google Meet conferencing data");
-      }
-      
       const meeting = this._formatMeetingData(createdEvent);
+      
       if (!meeting) {
-        throw new Error("Failed to format meeting data for newly created event");
+        throw new Error('無法格式化創建的會議資料');
       }
       
       return meeting;
     } catch (error) {
-      throw new Error(`Error creating meeting: ${error.message}`);
+      throw new Error(`創建會議時發生錯誤：${error.message}`);
     }
   }
   
   /**
    * Update an existing Google Meet meeting.
    * @param {string} meetingId - ID of the meeting to update
-   * @param {Object} updateData - Fields to update
+   * @param {Object} updates - Updates to apply
    * @returns {Promise<Object>} - Updated meeting details
    */
   async updateMeeting(meetingId, { summary, description, startTime, endTime, attendees } = {}) {
     try {
-      // First, get the existing event
-      const response = await this.calendar.events.get({
+      // First get the existing event
+      const existingResponse = await this.calendar.events.get({
         calendarId: 'primary',
-        eventId: meetingId
+        eventId: meetingId,
+        conferenceDataVersion: 1
       });
       
-      const event = response.data;
+      const existingEvent = existingResponse.data;
       
-      // Update the fields that were provided
+      // Prepare the update object
+      const updates = {
+        ...existingEvent,
+      };
+      
       if (summary !== undefined) {
-        event.summary = summary;
+        updates.summary = summary;
       }
       
       if (description !== undefined) {
-        event.description = description;
+        updates.description = description;
       }
       
       if (startTime !== undefined) {
-        event.start.dateTime = startTime;
+        updates.start = {
+          dateTime: startTime,
+          timeZone: 'UTC',
+        };
       }
       
       if (endTime !== undefined) {
-        event.end.dateTime = endTime;
+        updates.end = {
+          dateTime: endTime,
+          timeZone: 'UTC',
+        };
       }
       
       if (attendees !== undefined) {
-        event.attendees = attendees.map(email => ({ email }));
+        updates.attendees = attendees.map(email => ({ email }));
       }
       
-      // Make the API call to update the event
-      const updateResponse = await this.calendar.events.update({
+      const response = await this.calendar.events.update({
         calendarId: 'primary',
         eventId: meetingId,
         conferenceDataVersion: 1,
-        resource: event
+        sendUpdates: 'all', // Send updates to all attendees
+        resource: updates
       });
       
-      const updatedEvent = updateResponse.data;
-      
-      if (!updatedEvent.conferenceData) {
-        throw new Error("Updated event does not have Google Meet conferencing data");
-      }
-      
+      const updatedEvent = response.data;
       const meeting = this._formatMeetingData(updatedEvent);
+      
       if (!meeting) {
-        throw new Error("Failed to format meeting data for updated event");
+        throw new Error('無法格式化更新的會議資料');
       }
       
       return meeting;
     } catch (error) {
-      throw new Error(`Error updating meeting: ${error.message}`);
+      throw new Error(`更新會議時發生錯誤：${error.message}`);
     }
   }
   
   /**
    * Delete a Google Meet meeting.
    * @param {string} meetingId - ID of the meeting to delete
-   * @returns {Promise<boolean>} - True if deleted successfully
+   * @returns {Promise<void>}
    */
   async deleteMeeting(meetingId) {
     try {
       await this.calendar.events.delete({
         calendarId: 'primary',
-        eventId: meetingId
+        eventId: meetingId,
+        sendUpdates: 'all' // Send cancellation to all attendees
       });
-      
-      return true;
     } catch (error) {
-      throw new Error(`Error deleting meeting: ${error.message}`);
+      throw new Error(`刪除會議時發生錯誤：${error.message}`);
     }
   }
-  
+
   /**
-   * Format event data to meeting format.
-   * @param {Object} event - Event data from Google Calendar API
-   * @returns {Object|null} - Formatted meeting data or null
+   * Check for time conflicts with existing events.
+   * @param {string} startTime - Start time in ISO format
+   * @param {string} endTime - End time in ISO format
+   * @param {Array<string>} calendars - List of calendar IDs to check
+   * @returns {Promise<Array>} - List of conflicting events
+   */
+  async checkTimeConflicts(startTime, endTime, calendars = ['primary']) {
+    try {
+      const conflicts = [];
+      
+      for (const calendarId of calendars) {
+        const response = await this.calendar.events.list({
+          calendarId: calendarId,
+          timeMin: startTime,
+          timeMax: endTime,
+          singleEvents: true,
+          orderBy: 'startTime',
+          conferenceDataVersion: 1
+        });
+        
+        const events = response.data.items || [];
+        
+        for (const event of events) {
+          // Check if events overlap
+          const eventStart = new Date(event.start.dateTime || event.start.date);
+          const eventEnd = new Date(event.end.dateTime || event.end.date);
+          const checkStart = new Date(startTime);
+          const checkEnd = new Date(endTime);
+          
+          // Events overlap if: start1 < end2 && start2 < end1
+          if (eventStart < checkEnd && checkStart < eventEnd) {
+            conflicts.push({
+              id: event.id,
+              summary: event.summary || '無標題',
+              start_time: event.start.dateTime || event.start.date,
+              end_time: event.end.dateTime || event.end.date,
+              calendar: calendarId
+            });
+          }
+        }
+      }
+      
+      return conflicts;
+    } catch (error) {
+      throw new Error(`檢查時間衝突時發生錯誤：${error.message}`);
+    }
+  }
+
+  /**
+   * Check availability for a specific time range.
+   * @param {string} startTime - Start time in ISO format
+   * @param {string} endTime - End time in ISO format
+   * @param {Array<string>} calendars - List of calendar IDs to check
+   * @returns {Promise<Object>} - Availability information
+   */
+  async checkAvailability(startTime, endTime, calendars = ['primary']) {
+    try {
+      const conflicts = await this.checkTimeConflicts(startTime, endTime, calendars);
+      
+      return {
+        available: conflicts.length === 0,
+        conflicts: conflicts,
+        checked_calendars: calendars,
+        time_range: {
+          start: startTime,
+          end: endTime
+        }
+      };
+    } catch (error) {
+      throw new Error(`檢查可用性時發生錯誤：${error.message}`);
+    }
+  }
+
+  /**
+   * Get free/busy information for calendars.
+   * @param {string} startTime - Start time in ISO format
+   * @param {string} endTime - End time in ISO format
+   * @param {Array<string>} calendars - List of calendar IDs to check
+   * @returns {Promise<Object>} - Free/busy information
+   */
+  async getFreeBusy(startTime, endTime, calendars = ['primary']) {
+    try {
+      const response = await this.calendar.freebusy.query({
+        resource: {
+          timeMin: startTime,
+          timeMax: endTime,
+          items: calendars.map(id => ({ id }))
+        }
+      });
+      
+      const busyTimes = {};
+      const freebusyData = response.data.calendars;
+      
+      for (const [calendarId, data] of Object.entries(freebusyData)) {
+        busyTimes[calendarId] = {
+          busy: data.busy || [],
+          errors: data.errors || []
+        };
+      }
+      
+      return {
+        time_range: {
+          start: startTime,
+          end: endTime
+        },
+        calendars: busyTimes
+      };
+    } catch (error) {
+      throw new Error(`獲取忙碌時間資訊時發生錯誤：${error.message}`);
+    }
+  }
+
+  /**
+   * Format meeting data for consistent output.
+   * @param {Object} event - Google Calendar event object
+   * @returns {Object|null} - Formatted meeting data
    */
   _formatMeetingData(event) {
-    if (!event.conferenceData) {
+    if (!event || !event.conferenceData) {
       return null;
     }
     
-    // Extract the Google Meet link
-    let meetLink = null;
-    for (const entryPoint of event.conferenceData.entryPoints || []) {
-      if (entryPoint.entryPointType === 'video') {
-        meetLink = entryPoint.uri;
-        break;
+    // Extract Google Meet link
+    let meetLink = '';
+    let phoneInfo = '';
+    
+    if (event.conferenceData.entryPoints) {
+      const videoEntry = event.conferenceData.entryPoints.find(ep => ep.entryPointType === 'video');
+      const phoneEntry = event.conferenceData.entryPoints.find(ep => ep.entryPointType === 'phone');
+      
+      if (videoEntry) {
+        meetLink = videoEntry.uri;
       }
-    }
-    
-    if (!meetLink) {
-      return null;
+      
+      if (phoneEntry) {
+        phoneInfo = `${phoneEntry.label || ''} ${phoneEntry.uri || ''}`.trim();
+      }
     }
     
     // Format attendees
     const attendees = (event.attendees || []).map(attendee => ({
       email: attendee.email,
-      response_status: attendee.responseStatus
+      status: attendee.responseStatus || 'needsAction',
+      optional: attendee.optional || false
     }));
     
-    // Build the formatted meeting data
-    const meeting = {
+    return {
       id: event.id,
-      summary: event.summary || '',
+      summary: event.summary || '無標題',
       description: event.description || '',
+      start_time: event.start.dateTime || event.start.date,
+      end_time: event.end.dateTime || event.end.date,
       meet_link: meetLink,
-      start_time: event.start?.dateTime || event.start?.date,
-      end_time: event.end?.dateTime || event.end?.date,
+      phone_info: phoneInfo,
       attendees: attendees,
-      creator: event.creator?.email,
-      organizer: event.organizer?.email,
       created: event.created,
       updated: event.updated,
+      creator: event.creator,
+      organizer: event.organizer,
+      status: event.status,
+      html_link: event.htmlLink,
+      conference_id: event.conferenceData.conferenceId || '',
+      location: event.location || ''
     };
-    
-    return meeting;
   }
 }
 
